@@ -270,7 +270,16 @@ export default function Reader({ lessonId, onBack, onChanged, notify }) {
 
   useEffect(() => {
     if (!playing || activeIndex < 0) return
-    activeElRef.current?.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
+    const textContainer = document.querySelector('.reader-text.scrollable')
+    if (textContainer && activeElRef.current) {
+      const containerRect = textContainer.getBoundingClientRect()
+      const elementRect = activeElRef.current.getBoundingClientRect()
+
+      // Only scroll if element is outside the visible area
+      if (elementRect.top < containerRect.top || elementRect.bottom > containerRect.bottom) {
+        activeElRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      }
+    }
   }, [activeIndex, playing])
 
   useEffect(() => {
@@ -651,35 +660,36 @@ export default function Reader({ lessonId, onBack, onChanged, notify }) {
 
   return (
     <div className="page reader-page">
-      <header className="page-head reader-top">
-        <div className="reader-heading">
-          <button type="button" className="btn ghost small" onClick={onBack}>
-            ← Library
-          </button>
-          <div>
-            <h1 className="page-title">{lesson.title}</h1>
-            <p className="page-sub">
-              <span className="badge">{sourceLabel}</span>
-              {totals.uniqueWords} unique · {totals.newWords} new · {totals.learningWords} learning ·{' '}
-              {totals.knownWords} known
-            </p>
-          </div>
-        </div>
-        <div className="reader-progress" title={`${pct}% known`}>
-          <span style={{ width: `${pct}%` }} />
-        </div>
-      </header>
 
       <div className="reader-grid">
         <div className="reader-main">
+          <header className="page-head reader-top">
+            <div className="reader-heading">
+              <button type="button" className="btn ghost small" onClick={onBack}>
+                ← Library
+              </button>
+              <div>
+                <h1 className="page-title">{lesson.title}</h1>
+                <p className="page-sub">
+                  <span className="badge">{sourceLabel}</span>
+                  {totals.uniqueWords} unique · {totals.newWords} new · {totals.learningWords} learning ·{' '}
+                  {totals.knownWords} known
+                </p>
+              </div>
+            </div>
+            <div className="reader-progress" title={`${pct}% known`}>
+              <span style={{ width: `${pct}%` }} />
+            </div>
+          </header>
+
           {mode === 'youtube' ? (
-            <div className="media-frame">
+            <div className="media-frame fixed">
               <div className="yt-host" ref={hostRef} />
             </div>
           ) : null}
 
           {mode === 'audio' ? (
-            <div className="media-frame audio-frame">
+            <div className="media-frame audio-frame fixed">
               <audio
                 ref={audioRef}
                 src={lesson.audio_url}
@@ -744,7 +754,7 @@ export default function Reader({ lessonId, onBack, onChanged, notify }) {
 
           {mediaError ? <p className="hint error hint-inline">{mediaError}</p> : null}
 
-          <article className={`reader-text${dragging ? ' dragging' : ''}`}>{tokens.map(renderToken)}</article>
+          <article className={`reader-text scrollable${dragging ? ' dragging' : ''}`}>{tokens.map(renderToken)}</article>
 
           <div className="legend">
             {STATUSES.map((item) => (

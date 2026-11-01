@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 import requests
 
-from db import execute, row, now
+import store
 
 GOOGLE = "https://translate.googleapis.com/translate_a/single"
 GOOGLE_ALT = "https://translate.google.com/translate_a/single"
@@ -173,18 +173,11 @@ def _settle(job) -> str | None:
 
 
 def cached(text: str, target: str = "en") -> str | None:
-    found = row(
-        "SELECT result FROM translations WHERE source = ? AND target_lang = ?",
-        (text, target),
-    )
-    return found["result"] if found else None
+    return store.translation_get(text, target)
 
 
 def save_cache(text: str, result: str, target: str = "en"):
-    execute(
-        "INSERT OR REPLACE INTO translations (source, target_lang, result, created_at) VALUES (?, ?, ?, ?)",
-        (text, target, result, now()),
-    )
+    store.translation_put(text, target, result)
 
 
 def translate(

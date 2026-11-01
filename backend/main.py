@@ -10,8 +10,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import srs
+import store
 import transcripts
-from db import DB_PATH, execute, init_db, now, row, rows
 from dictionary import lookup as dictionary_lookup
 from explain import explain as explain_word
 from nlp import analyze, cyrillic_ratio, tokenize
@@ -25,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-init_db()
+store.init()
 
 
 class LessonIn(BaseModel):
@@ -91,14 +91,14 @@ def word_payload(w: dict) -> dict:
 
 
 def lesson_or_404(lesson_id: int) -> dict:
-    lesson = row("SELECT * FROM lessons WHERE id = ?", (lesson_id,))
+    lesson = store.lesson_get(lesson_id)
     if not lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
     return lesson
 
 
 def lesson_counts(text: str, vocab: dict[str, dict] | None = None) -> dict:
-    vocab = vocab if vocab is not None else {w["lemma"]: w for w in rows("SELECT id, lemma, status FROM words")}
+    vocab = vocab if vocab is not None else store.word_vocab()
     lemmas = {analyze(t["text"])["lemma"] for t in tokenize(text) if t["kind"] == "word"}
     total = len(lemmas)
     known = sum(1 for lemma in lemmas if vocab.get(lemma, {}).get("status", 0) >= 3)
@@ -110,28 +110,19 @@ def add_context(word_id: int, lesson_id: int | None, sentence: str | None):
     sentence = (sentence or "").strip()
     if not sentence:
         return
-    exists = row(
-        "SELECT id FROM contexts WHERE word_id = ? AND sentence = ?",
-        (word_id, sentence),
-    )
-    if not exists:
-        execute(
-            "INSERT INTO contexts (word_id, lesson_id, sentence, created_at) VALUES (?, ?, ?, ?)",
-            (word_id, lesson_id, sentence, now()),
-        )
+    if not store.context_exists(word_id, sentence):
+        store.context_add(word_id, lesson_id, sentence)
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "db": DB_PATH}
+    return {"ok": True, "db": store.target(), "store": store.backend()}
 
 
 @app.get("/api/lessons")
 def list_lessons():
-    vocab = {w["lemma"]: w for w in rows("SELECT id, lemma, status FROM words")}
-    lessons = rows(
-        "SELECT id, title, text, source_type, youtube_id, audio_url, created_at, last_opened_at, position, cues_json FROM lessons ORDER BY COALESCE(last_opened_at, created_at) DESC"
-    )
+    vocab = store.word_vocab()
+    lessons = store.lesson_list()
     result = []
     for lesson in lessons:
         stats = lesson_counts(lesson["text"], vocab)
@@ -184,11 +175,8 @@ def create_lesson(body: LessonIn):
 
     title = (body.title or "").strip() or ("YouTube lesson" if source_type == "youtube" else text[:48] + ("…" if len(text) > 48 else ""))
     cues_json = json.dumps(cues, ensure_ascii=False) if cues else None
-    cursor = execute(
-        "INSERT INTO lessons (title, text, source_type, youtube_id, audio_url, cues_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (title, text, source_type, video, body.audio_url, cues_json, now()),
-    )
-    return {"id": cursor.lastrowid, "title": title, "source_type": source_type, "youtube_id": video, "cues": len(cues or [])}
+    lesson = store.lesson_create(title, text, source_type, video, body.audio_url, cues_json)
+    return {"id": lesson["id"], "title": title, "source_type": source_type, "youtube_id": video, "cues": len(cues or [])}
 
 
 @app.get("/api/lessons/{lesson_id}")
@@ -202,26 +190,29 @@ def get_lesson(lesson_id: int):
 @app.patch("/api/lessons/{lesson_id}")
 def patch_lesson(lesson_id: int, body: LessonPatch):
     lesson_or_404(lesson_id)
+    fields = {}
     if body.title is not None:
-        execute("UPDATE lessons SET title = ? WHERE id = ?", (body.title.strip() or "Untitled", lesson_id))
+        fields["title"] = body.title.strip() or "Untitled"
     if body.position is not None:
-        execute("UPDATE lessons SET position = ? WHERE id = ?", (max(0, body.position), lesson_id))
+        fields["position"] = max(0, body.position)
     if body.touched:
-        execute("UPDATE lessons SET last_opened_at = ? WHERE id = ?", (now(), lesson_id))
+        fields["last_opened_at"] = store.now()
+    if fields:
+        store.lesson_update(lesson_id, **fields)
     return get_lesson(lesson_id)
 
 
 @app.delete("/api/lessons/{lesson_id}")
 def delete_lesson(lesson_id: int):
     lesson_or_404(lesson_id)
-    execute("DELETE FROM lessons WHERE id = ?", (lesson_id,))
+    store.lesson_delete(lesson_id)
     return {"ok": True}
 
 
 @app.get("/api/lessons/{lesson_id}/reader")
 def reader(lesson_id: int):
     lesson = lesson_or_404(lesson_id)
-    vocab = {w["lemma"]: w for w in rows("SELECT * FROM words")}
+    vocab = store.word_table()
     tokens = []
     for token in tokenize(lesson["text"]):
         if token["kind"] == "word":
@@ -251,26 +242,19 @@ def lookup(body: LookupIn):
         raise HTTPException(status_code=422, detail="Word is empty")
     info = analyze(surface)
     lemma = info["lemma"]
-    word = row("SELECT * FROM words WHERE lemma = ?", (lemma,))
+    word = store.word_by_lemma(lemma)
     is_new = False
     if not word:
         is_new = True
         translation = translate(lemma)["translation"] or None
-        cursor = execute(
-            "INSERT INTO words (lemma, surface, translation, grammar, status, created_at, updated_at, due_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-            (lemma, surface, translation, info["grammar"], now(), now(), now()),
-        )
-        word = row("SELECT * FROM words WHERE id = ?", (cursor.lastrowid,))
+        word = store.word_create(lemma, surface, translation, info["grammar"])
     elif not word.get("translation"):
         translation = translate(lemma)["translation"]
         if translation:
-            execute("UPDATE words SET translation = ?, updated_at = ? WHERE id = ?", (translation, now(), word["id"]))
-            word = row("SELECT * FROM words WHERE id = ?", (word["id"],))
+            store.word_update(word["id"], translation=translation)
+            word = store.word_by_id(word["id"])
     add_context(word["id"], body.lesson_id, body.sentence)
-    contexts = rows(
-        "SELECT lesson_id, sentence FROM contexts WHERE word_id = ? ORDER BY id DESC LIMIT 3",
-        (word["id"],),
-    )
+    contexts = store.context_recent(word["id"], 3)
     payload = word_payload(word)
     payload.update(
         {
@@ -302,7 +286,7 @@ def phrase(body: PhraseIn):
     parts = [t for t in tokenize(text) if t["kind"] == "word"]
     if not parts:
         raise HTTPException(status_code=422, detail="Phrase has no Russian words")
-    vocab = {w["lemma"]: w for w in rows("SELECT id, lemma, status FROM words")}
+    vocab = store.word_vocab()
     words = []
     for part in parts:
         info = analyze(part["text"])
@@ -318,19 +302,15 @@ def phrase(body: PhraseIn):
             }
         )
     translation = translate(text)["translation"] or ""
-    word = row("SELECT * FROM words WHERE lemma = ?", (text,))
+    word = store.word_by_lemma(text)
     is_new = False
     if body.save:
         if not word:
             is_new = True
-            cursor = execute(
-                "INSERT INTO words (lemma, surface, translation, grammar, status, created_at, updated_at, due_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-                (text, text, translation or None, None, now(), now(), now()),
-            )
-            word = row("SELECT * FROM words WHERE id = ?", (cursor.lastrowid,))
+            word = store.word_create(text, text, translation or None, None)
         elif not word.get("translation") and translation:
-            execute("UPDATE words SET translation = ?, updated_at = ? WHERE id = ?", (translation, now(), word["id"]))
-            word = row("SELECT * FROM words WHERE id = ?", (word["id"],))
+            store.word_update(word["id"], translation=translation)
+            word = store.word_by_id(word["id"])
         add_context(word["id"], body.lesson_id, body.sentence)
     return {
         "phrase": text,
@@ -350,77 +330,59 @@ def list_words(
     limit: int = 500,
 ):
     limit = max(1, min(2000, int(limit)))
-    sql = "SELECT * FROM words WHERE 1=1"
-    params: list = []
-    if status is not None:
-        sql += " AND status = ?"
-        params.append(status)
-    if q:
-        sql += " AND (lemma LIKE ? OR translation LIKE ?)"
-        params.extend([f"%{q}%", f"%{q}%"])
-    if due:
-        sql += " AND (due_at IS NULL OR due_at <= ?)"
-        params.append(now())
-    sql += " ORDER BY CASE WHEN due_at IS NULL THEN 0 ELSE 1 END, due_at, lemma LIMIT ?"
-    params.append(limit)
-    words = rows(sql, params)
+    due_ts = store.now() if due else None
+    words = store.word_query(status=status, q=q, due=due_ts, limit=limit)
     for word in words:
         word["due_label"] = srs.label(word["interval_days"]) if word.get("due_at") else "new"
-        word["context_count"] = row("SELECT COUNT(*) AS c FROM contexts WHERE word_id = ?", (word["id"],))["c"]
+        word["context_count"] = store.context_count(word["id"])
     return words
 
 
 @app.get("/api/words/{word_id}")
 def get_word(word_id: int):
-    word = row("SELECT * FROM words WHERE id = ?", (word_id,))
+    word = store.word_by_id(word_id)
     if not word:
         raise HTTPException(status_code=404, detail="Word not found")
-    word["contexts"] = rows(
-        "SELECT c.sentence, c.lesson_id, l.title FROM contexts c LEFT JOIN lessons l ON l.id = c.lesson_id WHERE c.word_id = ? ORDER BY c.id DESC LIMIT 8",
-        (word_id,),
-    )
+    word["contexts"] = store.context_titles(word_id, 8)
     word["due_label"] = srs.label(word["interval_days"]) if word.get("due_at") else "new"
     return word_payload(word) | {"contexts": word["contexts"]}
 
 
 @app.patch("/api/words/{word_id}")
 def patch_word(word_id: int, body: WordPatch):
-    word = row("SELECT * FROM words WHERE id = ?", (word_id,))
+    word = store.word_by_id(word_id)
     if not word:
         raise HTTPException(status_code=404, detail="Word not found")
+    fields = {}
     if body.translation is not None:
-        execute("UPDATE words SET translation = ?, updated_at = ? WHERE id = ?", (body.translation.strip(), now(), word_id))
+        fields["translation"] = body.translation.strip()
     if body.grammar is not None:
-        execute("UPDATE words SET grammar = ?, updated_at = ? WHERE id = ?", (body.grammar.strip(), now(), word_id))
+        fields["grammar"] = body.grammar.strip()
     if body.status is not None:
-        status = max(0, min(4, body.status))
-        execute("UPDATE words SET status = ?, updated_at = ? WHERE id = ?", (status, now(), word_id))
+        fields["status"] = max(0, min(4, body.status))
+    if fields:
+        store.word_update(word_id, **fields)
     return get_word(word_id)
 
 
 @app.delete("/api/words/{word_id}")
 def delete_word(word_id: int):
-    if not row("SELECT id FROM words WHERE id = ?", (word_id,)):
+    if not store.word_by_id(word_id):
         raise HTTPException(status_code=404, detail="Word not found")
-    execute("DELETE FROM words WHERE id = ?", (word_id,))
+    store.word_delete(word_id)
     return {"ok": True}
 
 
 @app.get("/api/practice/due")
 def practice_due(limit: int = 20):
     limit = max(1, min(100, int(limit)))
-    words = rows(
-        "SELECT * FROM words WHERE status >= 1 AND (due_at IS NULL OR due_at <= ?) ORDER BY CASE WHEN due_at IS NULL THEN 0 ELSE 1 END, due_at LIMIT ?",
-        (now(), limit),
-    )
+    words = store.word_due()[:limit]
+    ts = store.now()
     for word in words:
-        contexts = rows(
-            "SELECT sentence, lesson_id FROM contexts WHERE word_id = ? ORDER BY id DESC LIMIT 1",
-            (word["id"],),
-        )
-        word["context"] = contexts[0]["sentence"] if contexts else None
+        sentence = store.context_latest(word["id"])
+        word["context"] = sentence
         word["options"] = {
-            str(grade): srs.label(srs.schedule(word, grade, now())["interval_days"])
+            str(grade): srs.label(srs.schedule(word, grade, ts)["interval_days"])
             for grade in (1, 2, 3, 4)
         }
     return {"due": len(words), "words": words}
@@ -428,30 +390,24 @@ def practice_due(limit: int = 20):
 
 @app.post("/api/practice/{word_id}")
 def practice_grade(word_id: int, body: GradeIn):
-    word = row("SELECT * FROM words WHERE id = ?", (word_id,))
+    word = store.word_by_id(word_id)
     if not word:
         raise HTTPException(status_code=404, detail="Word not found")
     grade = max(1, min(4, body.grade))
-    plan = srs.schedule(word, grade, now())
-    execute(
-        "UPDATE words SET ease = ?, interval_days = ?, reps = ?, lapses = ?, due_at = ?, status = ?, last_reviewed_at = ?, updated_at = ? WHERE id = ?",
-        (
-            plan["ease"],
-            plan["interval_days"],
-            plan["reps"],
-            plan["lapses"],
-            plan["due_at"],
-            plan["status"],
-            plan["last_reviewed_at"],
-            now(),
-            word_id,
-        ),
+    ts = store.now()
+    plan = srs.schedule(word, grade, ts)
+    store.word_update(
+        word_id,
+        ease=plan["ease"],
+        interval_days=plan["interval_days"],
+        reps=plan["reps"],
+        lapses=plan["lapses"],
+        due_at=plan["due_at"],
+        status=plan["status"],
+        last_reviewed_at=plan["last_reviewed_at"],
     )
-    execute(
-        "INSERT INTO reviews (word_id, grade, interval_before, interval_after, reviewed_at) VALUES (?, ?, ?, ?, ?)",
-        (word_id, grade, float(word["interval_days"] or 0), plan["interval_days"], now()),
-    )
-    updated = row("SELECT * FROM words WHERE id = ?", (word_id,))
+    store.review_add(word_id, grade, float(word["interval_days"] or 0), plan["interval_days"], ts)
+    updated = store.word_by_id(word_id)
     return {
         "word": word_payload(updated),
         "next_due": srs.label(plan["interval_days"]),
@@ -462,25 +418,22 @@ def practice_grade(word_id: int, body: GradeIn):
 @app.get("/api/stats")
 def stats():
     by_status = {str(i): 0 for i in range(5)}
-    for item in rows("SELECT status, COUNT(*) AS c FROM words GROUP BY status"):
-        by_status[str(item["status"])] = item["c"]
+    status_counts = store.word_status_counts()
+    for status, count in status_counts.items():
+        by_status[str(status)] = count
     total = sum(by_status.values())
-    due = row("SELECT COUNT(*) AS c FROM words WHERE status >= 1 AND (due_at IS NULL OR due_at <= ?)", (now(),))["c"]
-    lessons = row("SELECT COUNT(*) AS c FROM lessons")["c"]
-    reviews_by_day = []
+    due = store.word_due_total()
+    lessons = store.lesson_total()
     today = int(time.time())
+    week_start = today - 6 * 86400
+    review_times = store.review_times_since(week_start)
+    reviews_by_day = []
     for offset in range(6, -1, -1):
         start = today - offset * 86400
         midnight = start - (start % 86400)
-        count = row(
-            "SELECT COUNT(*) AS c FROM reviews WHERE reviewed_at >= ? AND reviewed_at < ?",
-            (midnight, midnight + 86400),
-        )["c"]
+        count = sum(1 for t in review_times if midnight <= t < midnight + 86400)
         reviews_by_day.append({"day": midnight, "count": count})
-    reviewed_today = row(
-        "SELECT COUNT(*) AS c FROM reviews WHERE reviewed_at >= ?",
-        (today - (today % 86400),),
-    )["c"]
+    reviewed_today = reviews_by_day[-1]["count"] if reviews_by_day else 0
     return {
         "totalWords": total,
         "byStatus": by_status,
@@ -507,18 +460,14 @@ def youtube(url: str):
 
 @app.get("/api/export/anki")
 def export_anki():
-    words = rows("SELECT * FROM words ORDER BY created_at")
+    words = store.word_all()
     lines = [
         "#separator:tab",
         "#html:true",
         "#columns:Word\tTranslation\tContext\tGrammar\tStatus",
     ]
     for word in words:
-        context = row(
-            "SELECT sentence FROM contexts WHERE word_id = ? ORDER BY id DESC LIMIT 1",
-            (word["id"],),
-        )
-        sentence = context["sentence"] if context else ""
+        sentence = store.context_latest(word["id"]) or ""
         lines.append(
             "\t".join(
                 [

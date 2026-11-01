@@ -1,536 +1,480 @@
 import json
 import os
 import time
-
 import requests
-
+from dotenv import load_dotenv
 import db
 
-URL = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
-KEY = (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY") or "").strip()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+URL = os.getenv("SUPABASE_URL", "").strip()
+KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 REMOTE = bool(URL and KEY)
-REST = f"{URL}/rest/v1"
-
-LESSON_COLUMNS = "id,title,text,source_type,youtube_id,audio_url,cues_json,created_at,last_opened_at,position"
-LESSON_FIELDS = ("title", "position", "last_opened_at")
-WORD_FIELDS = (
-    "lemma",
-    "surface",
-    "translation",
-    "grammar",
-    "status",
-    "reps",
-    "lapses",
-    "ease",
-    "interval_days",
-    "due_at",
-    "last_reviewed_at",
-)
-TABLES = (
-    ("lessons", "id"),
-    ("words", "id"),
-    ("contexts", "id"),
-    ("reviews", "id"),
-    ("translations", "source"),
-    ("dictionary_cache", "lemma"),
-)
-
+REST = f"{URL}/rest/v1" if URL else ""
 
 class StoreError(RuntimeError):
     pass
 
-
-def backend() -> str:
+def backend():
     return "supabase" if REMOTE else "sqlite"
 
+def target():
+    return REST if REMOTE else db.DB_PATH
 
-def target() -> str:
-    return URL if REMOTE else db.DB_PATH
-
-
-def now() -> int:
+def now():
     return int(time.time())
 
-
-def _headers(prefer: str | None = None) -> dict:
-    headers = {
+def _headers(prefer=None):
+    h = {
         "apikey": KEY,
         "Authorization": f"Bearer {KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Content-Type": "application/json"
     }
     if prefer:
-        headers["Prefer"] = prefer
-    return headers
+        h["Prefer"] = prefer
+    return h
 
-
-def _check(response, table: str, method: str):
-    if response.status_code < 400:
+def _check(response):
+    if 200 <= response.status_code < 300:
         return
-    detail = (response.text or "").strip().replace("\n", " ")
-    raise StoreError(f"{method} {table} failed with {response.status_code}: {detail[:280]}")
+    snippet = response.text[:300] if response.text else ""
+    raise StoreError(f"Supabase request failed: {response.status_code} {snippet}")
 
-
-def _request(method: str, table: str, params=None, payload=None, prefer=None, headers=None):
-    request_headers = _headers(prefer)
-    if headers:
-        request_headers.update(headers)
+def _rest(method, table, params=None, payload=None, prefer=None, extra=None):
+    url = f"{REST}/{table}"
+    if params:
+        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    headers = _headers(prefer)
+    if extra:
+        headers.update(extra)
     try:
-        response = requests.request(
-            method,
-            f"{REST}/{table}",
-            headers=request_headers,
-            params=params or {},
-            json=payload,
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        raise StoreError(f"{method} {table} could not reach Supabase ({exc.__class__.__name__})") from exc
-    _check(response, table, method)
-    return response
-
-
-def _rest(method: str, table: str, params=None, payload=None, prefer=None, headers=None):
-    response = _request(method, table, params, payload, prefer, headers)
-    if not response.content:
+        if method == "GET":
+            r = requests.get(url, headers=headers, timeout=30)
+        elif method == "POST":
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+        elif method == "PATCH":
+            r = requests.patch(url, headers=headers, json=payload, timeout=30)
+        elif method == "DELETE":
+            r = requests.delete(url, headers=headers, timeout=30)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        _check(r)
+        if r.headers.get("content-type", "").startswith("application/json") and r.text:
+            return r.json()
         return None
-    try:
-        return response.json()
-    except ValueError:
-        return None
+    except requests.RequestException as e:
+        raise StoreError(f"Network error: {e}")
 
+def _fetch(table, params=None):
+    return _rest("GET", table, params)
 
-def _fetch(table: str, params=None) -> list:
-    return _rest("GET", table, params) or []
+def _count(table, params=None):
+    p = dict(params or {})
+    result = _rest("GET", table, p, prefer="count=exact", extra={"Range": "0-0"})
+    content_range = result if isinstance(result, str) else ""
+    if "/" in content_range:
+        return int(content_range.split("/")[1])
+    return 0
 
+LESSON_COLUMNS = "id,title,text,source_type,youtube_id,audio_url,cues_json,created_at,last_opened_at,position"
+LESSON_FIELDS = ("title", "position", "last_opened_at")
+WORD_FIELDS = ("lemma", "surface", "translation", "grammar", "status", "reps", "lapses", "ease", "interval_days", "due_at", "last_reviewed_at")
 
-def _count(table: str, params=None, column: str = "id") -> int:
-    query = dict(params or {})
-    query["select"] = column
-    response = _request("GET", table, query, headers={"Range": "0-0", "Prefer": "count=exact"})
-    total = (response.headers.get("content-range") or "").split("/")[-1]
-    return int(total) if total.isdigit() else 0
-
-
-def init():
-    if not REMOTE:
-        db.init_db()
-        return
-    for table, column in TABLES:
-        try:
-            _fetch(table, {"select": column, "limit": "1"})
-        except StoreError as exc:
-            raise StoreError(
-                f"Supabase table '{table}' is not ready: {exc}. "
-                "Run supabase/schema.sql in the Supabase SQL editor, or unset SUPABASE_URL and "
-                "SUPABASE_SERVICE_KEY to keep using the local database."
-            ) from exc
-    if lesson_total() == 0:
-        for title, text in db.SEED_LESSONS:
-            lesson_create(title, text, "text", None, None, None)
-
-
-def lesson_list() -> list:
-    if not REMOTE:
-        return db.rows(
-            f"SELECT {LESSON_COLUMNS} FROM lessons ORDER BY COALESCE(last_opened_at, created_at) DESC"
-        )
-    return _fetch(
-        "lessons",
-        {"select": LESSON_COLUMNS, "order": "last_opened_at.desc.nullslast,created_at.desc"},
-    )
-
-
-def lesson_get(lesson_id: int) -> dict | None:
-    if not REMOTE:
-        return db.row(f"SELECT {LESSON_COLUMNS} FROM lessons WHERE id = ?", (lesson_id,))
-    found = _fetch("lessons", {"select": LESSON_COLUMNS, "id": f"eq.{lesson_id}", "limit": "1"})
-    return found[0] if found else None
-
-
-def lesson_create(title, text, source_type, youtube_id, audio_url, cues_json):
-    created_at = now()
-    payload = {
-        "title": title,
-        "text": text,
-        "source_type": source_type,
-        "youtube_id": youtube_id,
-        "audio_url": audio_url,
-        "cues_json": cues_json,
-        "created_at": created_at,
-    }
-    if not REMOTE:
-        cursor = db.execute(
-            "INSERT INTO lessons (title, text, source_type, youtube_id, audio_url, cues_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (title, text, source_type, youtube_id, audio_url, cues_json, created_at),
-        )
-        return cursor.lastrowid
-    created = _rest("POST", "lessons", None, payload, "return=representation")
-    return created[0]["id"]
-
-
-def lesson_update(lesson_id: int, **fields):
-    allowed = {key: value for key, value in fields.items() if key in LESSON_FIELDS}
-    if not allowed:
-        return lesson_get(lesson_id)
-    if not REMOTE:
-        assignments = ", ".join(f"{key} = ?" for key in allowed)
-        db.execute(f"UPDATE lessons SET {assignments} WHERE id = ?", (*allowed.values(), lesson_id))
-        return lesson_get(lesson_id)
-    updated = _rest("PATCH", "lessons", {"id": f"eq.{lesson_id}"}, allowed, "return=representation")
-    return updated[0] if updated else lesson_get(lesson_id)
-
-
-def lesson_delete(lesson_id: int):
-    if not REMOTE:
-        db.execute("DELETE FROM lessons WHERE id = ?", (lesson_id,))
-        return
-    _rest("DELETE", "lessons", {"id": f"eq.{lesson_id}"})
-
-
-def lesson_total() -> int:
-    if not REMOTE:
-        return db.row("SELECT COUNT(*) AS c FROM lessons")["c"]
-    return _count("lessons")
-
-
-def word_vocab() -> dict:
-    if not REMOTE:
-        return {word["lemma"]: word for word in db.rows("SELECT id, lemma, status FROM words")}
-    return {word["lemma"]: word for word in _fetch("words", {"select": "id,lemma,status"})}
-
-
-def word_table() -> dict:
-    if not REMOTE:
-        return {word["lemma"]: word for word in db.rows("SELECT * FROM words")}
-    return {word["lemma"]: word for word in _fetch("words", {"select": "*"})}
-
-
-def word_by_lemma(lemma: str) -> dict | None:
-    if not REMOTE:
-        return db.row("SELECT * FROM words WHERE lemma = ?", (lemma,))
-    found = _fetch("words", {"select": "*", "lemma": f"eq.{lemma}", "limit": "1"})
-    return found[0] if found else None
-
-
-def word_by_id(word_id: int) -> dict | None:
-    if not REMOTE:
-        return db.row("SELECT * FROM words WHERE id = ?", (word_id,))
-    found = _fetch("words", {"select": "*", "id": f"eq.{word_id}", "limit": "1"})
-    return found[0] if found else None
-
-
-def word_create(lemma, surface, translation, grammar) -> dict:
-    stamp = now()
-    payload = {
-        "lemma": lemma,
-        "surface": surface,
-        "translation": translation,
-        "grammar": grammar,
-        "status": 1,
-        "created_at": stamp,
-        "updated_at": stamp,
-        "due_at": stamp,
-    }
-    if not REMOTE:
-        cursor = db.execute(
-            "INSERT INTO words (lemma, surface, translation, grammar, status, created_at, updated_at, due_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
-            (lemma, surface, translation, grammar, stamp, stamp, stamp),
-        )
-        return word_by_id(cursor.lastrowid)
-    created = _rest("POST", "words", None, payload, "return=representation")
-    return created[0] if created else word_by_lemma(lemma)
-
-
-def word_update(word_id: int, **fields) -> dict | None:
-    allowed = {key: value for key, value in fields.items() if key in WORD_FIELDS}
-    if not allowed:
-        return word_by_id(word_id)
-    allowed["updated_at"] = now()
-    if not REMOTE:
-        assignments = ", ".join(f"{key} = ?" for key in allowed)
-        db.execute(f"UPDATE words SET {assignments} WHERE id = ?", (*allowed.values(), word_id))
-        return word_by_id(word_id)
-    updated = _rest("PATCH", "words", {"id": f"eq.{word_id}"}, allowed, "return=representation")
-    return updated[0] if updated else word_by_id(word_id)
-
-
-def word_delete(word_id: int):
-    if not REMOTE:
-        db.execute("DELETE FROM words WHERE id = ?", (word_id,))
-        return
-    _rest("DELETE", "words", {"id": f"eq.{word_id}"})
-
-
-def word_query(status=None, q=None, due: bool = False, limit: int = 500) -> list:
-    if not REMOTE:
-        sql = "SELECT * FROM words WHERE 1=1"
-        params: list = []
-        if status is not None:
-            sql += " AND status = ?"
-            params.append(status)
-        if q:
-            sql += " AND (lemma LIKE ? OR translation LIKE ?)"
-            params.extend([f"%{q}%", f"%{q}%"])
-        if due:
-            sql += " AND (due_at IS NULL OR due_at <= ?)"
-            params.append(now())
-        sql += " ORDER BY CASE WHEN due_at IS NULL THEN 0 ELSE 1 END, due_at, lemma LIMIT ?"
-        params.append(limit)
-        return db.rows(sql, params)
-    params = {
-        "select": "*",
-        "order": "due_at.asc.nullsfirst,lemma.asc",
-        "limit": str(limit),
-    }
-    if status is not None:
-        params["status"] = f"eq.{status}"
-    if q and due:
-        params["and"] = (
-            f"(or(lemma.ilike.*{q}*,translation.ilike.*{q}*),"
-            f"or(due_at.is.null,due_at.lte.{now()}))"
-        )
-    elif q:
-        params["or"] = f"(lemma.ilike.*{q}*,translation.ilike.*{q}*)"
-    elif due:
-        params["or"] = f"(due_at.is.null,due_at.lte.{now()})"
-    return _fetch("words", params)
-
-
-def word_due(limit: int = 20) -> list:
-    if not REMOTE:
-        return db.rows(
-            "SELECT * FROM words WHERE status >= 1 AND (due_at IS NULL OR due_at <= ?) "
-            "ORDER BY CASE WHEN due_at IS NULL THEN 0 ELSE 1 END, due_at LIMIT ?",
-            (now(), limit),
-        )
-    return _fetch(
-        "words",
-        {
-            "select": "*",
-            "status": "gte.1",
-            "or": f"(due_at.is.null,due_at.lte.{now()})",
-            "order": "due_at.asc.nullsfirst,lemma.asc",
-            "limit": str(limit),
-        },
-    )
-
-
-def word_status_counts() -> dict:
-    if not REMOTE:
-        return {
-            item["status"]: item["c"]
-            for item in db.rows("SELECT status, COUNT(*) AS c FROM words GROUP BY status")
+def lesson_list(limit=100):
+    if REMOTE:
+        params = {
+            "select": LESSON_COLUMNS,
+            "order": "last_opened_at.desc.nullslast,created_at.desc",
+            "limit": str(limit)
         }
-    counts: dict = {}
-    for item in _fetch("words", {"select": "status"}):
-        counts[item["status"]] = counts.get(item["status"], 0) + 1
-    return counts
+        return _fetch("lessons", params)
+    else:
+        return db.rows(
+            "SELECT id, title, text, source_type, youtube_id, audio_url, cues_json, created_at, last_opened_at, position FROM lessons ORDER BY last_opened_at DESC NULLS LAST, created_at DESC LIMIT ?",
+            (limit,)
+        )
 
-
-def word_total() -> int:
-    if not REMOTE:
-        return db.row("SELECT COUNT(*) AS c FROM words")["c"]
-    return _count("words")
-
-
-def word_due_total() -> int:
-    if not REMOTE:
+def lesson_get(lesson_id):
+    if REMOTE:
+        params = {"select": LESSON_COLUMNS, "id": f"eq.{lesson_id}"}
+        rows = _fetch("lessons", params)
+        return rows[0] if rows else None
+    else:
         return db.row(
-            "SELECT COUNT(*) AS c FROM words WHERE status >= 1 AND (due_at IS NULL OR due_at <= ?)",
-            (now(),),
-        )["c"]
-    return _count("words", {"status": "gte.1", "or": f"(due_at.is.null,due_at.lte.{now()})"})
-
-
-def word_all() -> list:
-    if not REMOTE:
-        return db.rows("SELECT * FROM words ORDER BY created_at")
-    return _fetch("words", {"select": "*", "order": "created_at.asc"})
-
-
-def context_exists(word_id: int, sentence: str) -> bool:
-    if not REMOTE:
-        return (
-            db.row(
-                "SELECT id FROM contexts WHERE word_id = ? AND sentence = ?",
-                (word_id, sentence),
-            )
-            is not None
+            "SELECT id, title, text, source_type, youtube_id, audio_url, cues_json, created_at, last_opened_at, position FROM lessons WHERE id = ?",
+            (lesson_id,)
         )
-    return bool(
-        _fetch(
-            "contexts",
-            {"select": "id", "word_id": f"eq.{word_id}", "sentence": f"eq.{sentence}", "limit": "1"},
-        )
-    )
 
-
-def context_add(word_id: int, lesson_id, sentence: str):
-    created_at = now()
-    if not REMOTE:
+def lesson_create(title, text, source_type, youtube_id=None, audio_url=None, cues_json=None):
+    ts = now()
+    if REMOTE:
+        payload = {
+            "title": title,
+            "text": text,
+            "source_type": source_type,
+            "youtube_id": youtube_id,
+            "audio_url": audio_url,
+            "cues_json": cues_json,
+            "created_at": ts
+        }
+        rows = _rest("POST", "lessons", payload=payload, prefer="return=representation")
+        return rows[0] if rows else None
+    else:
         db.execute(
-            "INSERT INTO contexts (word_id, lesson_id, sentence, created_at) VALUES (?, ?, ?, ?)",
-            (word_id, lesson_id, sentence, created_at),
+            "INSERT INTO lessons (title, text, source_type, youtube_id, audio_url, cues_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (title, text, source_type, youtube_id, audio_url, cues_json, ts)
         )
+        return db.row("SELECT id, title, text, source_type, youtube_id, audio_url, cues_json, created_at, last_opened_at, position FROM lessons WHERE id = last_insert_rowid()")
+
+def lesson_update(lesson_id, **fields):
+    filtered = {k: v for k, v in fields.items() if k in LESSON_FIELDS}
+    if not filtered:
         return
-    _rest(
-        "POST",
-        "contexts",
-        None,
-        {"word_id": word_id, "lesson_id": lesson_id, "sentence": sentence, "created_at": created_at},
-        "return=minimal",
-    )
+    if REMOTE:
+        filtered["updated_at"] = now()
+        params = {"id": f"eq.{lesson_id}"}
+        _rest("PATCH", "lessons", params, filtered, prefer="return=minimal")
+    else:
+        pairs = ", ".join(f"{k} = ?" for k in filtered.keys())
+        db.execute(f"UPDATE lessons SET {pairs} WHERE id = ?", (*filtered.values(), lesson_id))
 
+def lesson_delete(lesson_id):
+    if REMOTE:
+        params = {"id": f"eq.{lesson_id}"}
+        _rest("DELETE", "lessons", params)
+    else:
+        db.execute("DELETE FROM lessons WHERE id = ?", (lesson_id,))
 
-def context_recent(word_id: int, limit: int = 3) -> list:
-    if not REMOTE:
-        return db.rows(
-            "SELECT lesson_id, sentence FROM contexts WHERE word_id = ? ORDER BY id DESC LIMIT ?",
-            (word_id, limit),
+def lesson_total():
+    if REMOTE:
+        return _count("lessons")
+    else:
+        return db.row("SELECT COUNT(*) AS c FROM lessons")["c"]
+
+def word_vocab():
+    if REMOTE:
+        params = {"select": "id,lemma,status"}
+        rows = _fetch("words", params)
+        return {r["lemma"]: r for r in rows}
+    else:
+        rows = db.rows("SELECT id, lemma, status FROM words")
+        return {r["lemma"]: r for r in rows}
+
+def word_table():
+    if REMOTE:
+        params = {"select": "id,lemma,surface,translation,grammar,status,ease,interval_days,reps,lapses,due_at,created_at,updated_at,last_reviewed_at"}
+        rows = _fetch("words", params)
+        return {r["lemma"]: r for r in rows}
+    else:
+        rows = db.rows("SELECT id, lemma, surface, translation, grammar, status, ease, interval_days, reps, lapses, due_at, created_at, updated_at, last_reviewed_at FROM words")
+        return {r["lemma"]: r for r in rows}
+
+def word_by_lemma(lemma):
+    if REMOTE:
+        params = {"select": "id,lemma,surface,translation,grammar,status,ease,interval_days,reps,lapses,due_at,created_at,updated_at,last_reviewed_at", "lemma": f"eq.{lemma}"}
+        rows = _fetch("words", params)
+        return rows[0] if rows else None
+    else:
+        return db.row("SELECT id, lemma, surface, translation, grammar, status, ease, interval_days, reps, lapses, due_at, created_at, updated_at, last_reviewed_at FROM words WHERE lemma = ?", (lemma,))
+
+def word_by_id(word_id):
+    if REMOTE:
+        params = {"select": "id,lemma,surface,translation,grammar,status,ease,interval_days,reps,lapses,due_at,created_at,updated_at,last_reviewed_at", "id": f"eq.{word_id}"}
+        rows = _fetch("words", params)
+        return rows[0] if rows else None
+    else:
+        return db.row("SELECT id, lemma, surface, translation, grammar, status, ease, interval_days, reps, lapses, due_at, created_at, updated_at, last_reviewed_at FROM words WHERE id = ?", (word_id,))
+
+def word_create(lemma, surface, translation, grammar):
+    ts = now()
+    if REMOTE:
+        payload = {
+            "lemma": lemma,
+            "surface": surface,
+            "translation": translation,
+            "grammar": grammar,
+            "status": 1,
+            "due_at": ts,
+            "created_at": ts
+        }
+        rows = _rest("POST", "words", payload=payload, prefer="return=representation")
+        return rows[0] if rows else None
+    else:
+        db.execute(
+            "INSERT INTO words (lemma, surface, translation, grammar, status, due_at, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (lemma, surface, translation, grammar, ts, ts)
         )
-    return _fetch(
-        "contexts",
-        {
-            "select": "lesson_id,sentence",
-            "word_id": f"eq.{word_id}",
-            "order": "id.desc",
-            "limit": str(limit),
-        },
-    )
+        return db.row("SELECT id, lemma, surface, translation, grammar, status, ease, interval_days, reps, lapses, due_at, created_at, updated_at, last_reviewed_at FROM words WHERE id = last_insert_rowid()")
 
+def word_update(word_id, **fields):
+    filtered = {k: v for k, v in fields.items() if k in WORD_FIELDS}
+    if not filtered:
+        return
+    if REMOTE:
+        filtered["updated_at"] = now()
+        # Supabase integer columns reject float values like 3.0
+        for int_field in ("status", "reps", "lapses", "interval_days", "due_at", "last_reviewed_at"):
+            if int_field in filtered and filtered[int_field] is not None:
+                filtered[int_field] = int(filtered[int_field])
+        params = {"id": f"eq.{word_id}"}
+        _rest("PATCH", "words", params, filtered, prefer="return=minimal")
+    else:
+        filtered["updated_at"] = now()
+        pairs = ", ".join(f"{k} = ?" for k in filtered.keys())
+        db.execute(f"UPDATE words SET {pairs} WHERE id = ?", (*filtered.values(), word_id))
 
-def context_titles(word_id: int, limit: int = 8) -> list:
-    if not REMOTE:
-        return db.rows(
-            "SELECT c.sentence, c.lesson_id, l.title FROM contexts c "
-            "LEFT JOIN lessons l ON l.id = c.lesson_id WHERE c.word_id = ? ORDER BY c.id DESC LIMIT ?",
-            (word_id, limit),
-        )
-    found = _fetch(
-        "contexts",
-        {
+def word_delete(word_id):
+    if REMOTE:
+        params = {"id": f"eq.{word_id}"}
+        _rest("DELETE", "words", params)
+    else:
+        db.execute("DELETE FROM words WHERE id = ?", (word_id,))
+
+def word_query(status=None, q=None, due=None, limit=100):
+    if REMOTE:
+        params = {"select": "id,lemma,surface,translation,grammar,status,ease,interval_days,reps,lapses,due_at,created_at,updated_at,last_reviewed_at", "limit": str(limit)}
+        filters = []
+        if status is not None:
+            filters.append(f"status.eq.{status}")
+        if q:
+            filters.append(f"lemma.ilike.*{q}*")
+        if due is not None:
+            filters.append(f"or(due_at.is.null,due_at.lte.{due})")
+        if len(filters) > 1:
+            params["and"] = f"({','.join(filters)})"
+        elif len(filters) == 1:
+            parts = filters[0].split(".", 1)
+            params[parts[0]] = parts[1] if len(parts) > 1 else ""
+        return _fetch("words", params)
+    else:
+        conds = []
+        args = []
+        if status is not None:
+            conds.append("status = ?")
+            args.append(status)
+        if q:
+            conds.append("lemma LIKE ?")
+            args.append(f"%{q}%")
+        if due is not None:
+            conds.append("(due_at IS NULL OR due_at <= ?)")
+            args.append(due)
+        where = " AND ".join(conds) if conds else "1"
+        args.append(limit)
+        return db.rows(f"SELECT id, lemma, surface, translation, grammar, status, ease, interval_days, reps, lapses, due_at, created_at, updated_at, last_reviewed_at FROM words WHERE {where} LIMIT ?", args)
+
+def word_due():
+    ts = now()
+    if REMOTE:
+        params = {
+            "select": "id,lemma,surface,translation,status,reps",
+            "order": "due_at.asc.nullsfirst,lemma.asc"
+        }
+        params["or"] = f"(due_at.is.null,due_at.lte.{ts})"
+        return _fetch("words", params)
+    else:
+        return db.rows("SELECT id, lemma, surface, translation, status, reps FROM words WHERE due_at IS NULL OR due_at <= ? ORDER BY due_at ASC, lemma ASC", (ts,))
+
+def word_status_counts():
+    if REMOTE:
+        rows = _fetch("words", {"select": "status"})
+        counts = {}
+        for r in rows:
+            s = r["status"]
+            counts[s] = counts.get(s, 0) + 1
+        return counts
+    else:
+        rows = db.rows("SELECT status, COUNT(*) AS c FROM words GROUP BY status")
+        return {r["status"]: r["c"] for r in rows}
+
+def word_total():
+    if REMOTE:
+        return _count("words")
+    else:
+        return db.row("SELECT COUNT(*) AS c FROM words")["c"]
+
+def word_due_total():
+    ts = now()
+    if REMOTE:
+        params = {"or": f"(due_at.is.null,due_at.lte.{ts})"}
+        return _count("words", params)
+    else:
+        return db.row("SELECT COUNT(*) AS c FROM words WHERE due_at IS NULL OR due_at <= ?", (ts,))["c"]
+
+def word_all():
+    if REMOTE:
+        params = {"select": "id,lemma,surface,translation,grammar,status,ease,interval_days,reps,lapses,due_at,created_at,updated_at,last_reviewed_at"}
+        return _fetch("words", params)
+    else:
+        return db.rows("SELECT id, lemma, surface, translation, grammar, status, ease, interval_days, reps, lapses, due_at, created_at, updated_at, last_reviewed_at FROM words")
+
+def context_exists(word_id, sentence):
+    if REMOTE:
+        params = {"select": "id", "word_id": f"eq.{word_id}", "sentence": f"eq.{sentence}"}
+        rows = _fetch("contexts", params)
+        return bool(rows)
+    else:
+        return db.row("SELECT 1 FROM contexts WHERE word_id = ? AND sentence = ?", (word_id, sentence)) is not None
+
+def context_add(word_id, lesson_id, sentence):
+    ts = now()
+    if REMOTE:
+        payload = {"word_id": word_id, "lesson_id": lesson_id, "sentence": sentence, "created_at": ts}
+        _rest("POST", "contexts", payload=payload, prefer="return=minimal")
+    else:
+        db.execute("INSERT INTO contexts (word_id, lesson_id, sentence, created_at) VALUES (?, ?, ?, ?)", (word_id, lesson_id, sentence, ts))
+
+def context_recent(word_id, limit=3):
+    if REMOTE:
+        params = {
             "select": "sentence,lesson_id,lessons(title)",
             "word_id": f"eq.{word_id}",
-            "order": "id.desc",
-            "limit": str(limit),
-        },
-    )
-    return [
-        {
-            "sentence": item.get("sentence"),
-            "lesson_id": item.get("lesson_id"),
-            "title": (item.get("lessons") or {}).get("title"),
+            "order": "created_at.desc",
+            "limit": str(limit)
         }
-        for item in found
-    ]
+        rows = _fetch("contexts", params)
+        for r in rows:
+            if "lessons" in r and r["lessons"]:
+                r["lesson_title"] = r["lessons"]["title"]
+            del r["lessons"]
+        return rows
+    else:
+        return db.rows("""
+            SELECT c.sentence, c.lesson_id, l.title AS lesson_title
+            FROM contexts c
+            LEFT JOIN lessons l ON c.lesson_id = l.id
+            WHERE c.word_id = ?
+            ORDER BY c.created_at DESC
+            LIMIT ?
+        """, (word_id, limit))
 
+def context_titles(word_id, limit=8):
+    if REMOTE:
+        params = {
+            "select": "lesson_id,lessons(title)",
+            "word_id": f"eq.{word_id}",
+            "order": "created_at.desc",
+            "limit": str(limit)
+        }
+        rows = _fetch("contexts", params)
+        result = []
+        for r in rows:
+            if "lessons" in r and r["lessons"]:
+                result.append({"lesson_id": r["lesson_id"], "lesson_title": r["lessons"]["title"]})
+        return result
+    else:
+        return db.rows("""
+            SELECT c.lesson_id, l.title AS lesson_title
+            FROM contexts c
+            LEFT JOIN lessons l ON c.lesson_id = l.id
+            WHERE c.word_id = ?
+            ORDER BY c.created_at DESC
+            LIMIT ?
+        """, (word_id, limit))
 
-def context_latest(word_id: int) -> str | None:
-    found = context_recent(word_id, 1)
-    return found[0]["sentence"] if found else None
+def context_latest(word_id):
+    if REMOTE:
+        params = {
+            "select": "sentence",
+            "word_id": f"eq.{word_id}",
+            "order": "created_at.desc",
+            "limit": "1"
+        }
+        rows = _fetch("contexts", params)
+        return rows[0]["sentence"] if rows else None
+    else:
+        r = db.row("SELECT sentence FROM contexts WHERE word_id = ? ORDER BY created_at DESC LIMIT 1", (word_id,))
+        return r["sentence"] if r else None
 
-
-def context_count(word_id: int) -> int:
-    if not REMOTE:
+def context_count(word_id):
+    if REMOTE:
+        params = {"word_id": f"eq.{word_id}"}
+        return _count("contexts", params)
+    else:
         return db.row("SELECT COUNT(*) AS c FROM contexts WHERE word_id = ?", (word_id,))["c"]
-    return _count("contexts", {"word_id": f"eq.{word_id}"})
 
-
-def review_add(word_id: int, grade: int, interval_before, interval_after, reviewed_at=None):
-    stamp = reviewed_at or now()
-    if not REMOTE:
-        db.execute(
-            "INSERT INTO reviews (word_id, grade, interval_before, interval_after, reviewed_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (word_id, grade, float(interval_before or 0), interval_after, stamp),
-        )
-        return
-    _rest(
-        "POST",
-        "reviews",
-        None,
-        {
+def review_add(word_id, grade, interval_before, interval_after, reviewed_at):
+    if REMOTE:
+        payload = {
             "word_id": word_id,
             "grade": grade,
-            "interval_before": float(interval_before or 0),
+            "interval_before": interval_before,
             "interval_after": interval_after,
-            "reviewed_at": stamp,
-        },
-        "return=minimal",
-    )
-
-
-def review_times_since(start: int) -> list:
-    if not REMOTE:
-        return [
-            item["reviewed_at"]
-            for item in db.rows("SELECT reviewed_at FROM reviews WHERE reviewed_at >= ?", (start,))
-        ]
-    return [
-        item["reviewed_at"]
-        for item in _fetch("reviews", {"select": "reviewed_at", "reviewed_at": f"gte.{start}"})
-    ]
-
-
-def translation_get(source: str, target_lang: str = "en") -> str | None:
-    if not REMOTE:
-        found = db.row(
-            "SELECT result FROM translations WHERE source = ? AND target_lang = ?",
-            (source, target_lang),
-        )
-        return found["result"] if found else None
-    found = _fetch(
-        "translations",
-        {
-            "select": "result",
-            "source": f"eq.{source}",
-            "target_lang": f"eq.{target_lang}",
-            "limit": "1",
-        },
-    )
-    return found[0]["result"] if found else None
-
-
-def translation_put(source: str, target_lang: str, result: str):
-    created_at = now()
-    if not REMOTE:
+            "reviewed_at": reviewed_at
+        }
+        _rest("POST", "reviews", payload=payload, prefer="return=minimal")
+    else:
         db.execute(
-            "INSERT OR REPLACE INTO translations (source, target_lang, result, created_at) VALUES (?, ?, ?, ?)",
-            (source, target_lang, result, created_at),
+            "INSERT INTO reviews (word_id, grade, interval_before, interval_after, reviewed_at) VALUES (?, ?, ?, ?, ?)",
+            (word_id, grade, interval_before, interval_after, reviewed_at)
         )
-        return
-    _rest(
-        "POST",
-        "translations",
-        {"on_conflict": "source,target_lang"},
-        {"source": source, "target_lang": target_lang, "result": result, "created_at": created_at},
-        "resolution=merge-duplicates,return=minimal",
-    )
 
+def review_times_since(ts):
+    if REMOTE:
+        params = {
+            "select": "reviewed_at",
+            "reviewed_at": f"gte.{ts}",
+            "order": "reviewed_at.asc",
+            "limit": "100000"
+        }
+        rows = _fetch("reviews", params)
+        return [r["reviewed_at"] for r in rows]
+    else:
+        rows = db.rows("SELECT reviewed_at FROM reviews WHERE reviewed_at >= ? ORDER BY reviewed_at ASC", (ts,))
+        return [r["reviewed_at"] for r in rows]
 
-def dictionary_get(lemma: str) -> dict | None:
-    if not REMOTE:
-        found = db.row("SELECT payload FROM dictionary_cache WHERE lemma = ?", (lemma,))
-        return json.loads(found["payload"]) if found else None
-    found = _fetch("dictionary_cache", {"select": "payload", "lemma": f"eq.{lemma}", "limit": "1"})
-    return json.loads(found[0]["payload"]) if found else None
+def translation_get(text, target_lang):
+    if REMOTE:
+        params = {"select": "result", "source": f"eq.{text}", "target_lang": f"eq.{target_lang}"}
+        rows = _fetch("translations", params)
+        return rows[0]["result"] if rows else None
+    else:
+        r = db.row("SELECT result FROM translations WHERE source = ? AND target_lang = ?", (text, target_lang))
+        return r["result"] if r else None
 
+def translation_put(text, target_lang, result):
+    ts = now()
+    if REMOTE:
+        payload = {"source": text, "target_lang": target_lang, "result": result, "created_at": ts}
+        _rest("POST", "translations", payload=payload, prefer="resolution=merge-duplicates,return=minimal")
+    else:
+        db.execute("INSERT OR REPLACE INTO translations (source, target_lang, result, created_at) VALUES (?, ?, ?, ?)", (text, target_lang, result, ts))
 
-def dictionary_put(lemma: str, payload: str):
-    created_at = now()
-    if not REMOTE:
-        db.execute(
-            "INSERT OR REPLACE INTO dictionary_cache (lemma, payload, created_at) VALUES (?, ?, ?)",
-            (lemma, payload, created_at),
-        )
-        return
-    _rest(
-        "POST",
-        "dictionary_cache",
-        {"on_conflict": "lemma"},
-        {"lemma": lemma, "payload": payload, "created_at": created_at},
-        "resolution=merge-duplicates,return=minimal",
-    )
+def dictionary_get(lemma):
+    if REMOTE:
+        params = {"select": "payload", "lemma": f"eq.{lemma}"}
+        rows = _fetch("dictionary_cache", params)
+        return json.loads(rows[0]["payload"]) if rows else None
+    else:
+        r = db.row("SELECT payload FROM dictionary_cache WHERE lemma = ?", (lemma,))
+        return json.loads(r["payload"]) if r else None
+
+def dictionary_put(lemma, payload):
+    ts = now()
+    payload_str = json.dumps(payload, ensure_ascii=False)
+    if REMOTE:
+        p = {"lemma": lemma, "payload": payload_str, "created_at": ts}
+        _rest("POST", "dictionary_cache", payload=p, prefer="resolution=merge-duplicates,return=minimal")
+    else:
+        db.execute("INSERT OR REPLACE INTO dictionary_cache (lemma, payload, created_at) VALUES (?, ?, ?)", (lemma, payload_str, ts))
+
+def init():
+    if REMOTE:
+        probe = {
+            "lessons": "id",
+            "words": "id",
+            "contexts": "id",
+            "reviews": "id",
+            "translations": "source",
+            "dictionary_cache": "lemma"
+        }
+        for table, col in probe.items():
+            try:
+                params = {"select": col, "limit": "1"}
+                _fetch(table, params)
+            except StoreError as e:
+                raise StoreError(f"Supabase table '{table}' not accessible. Run supabase/schema.sql in the Supabase SQL editor, or unset SUPABASE_URL and SUPABASE_SERVICE_KEY to use the local database.")
+        if lesson_total() == 0:
+            for lesson in db.SEED_LESSONS:
+                lesson_create(lesson[0], lesson[1], "text")
+    else:
+        db.init_db()

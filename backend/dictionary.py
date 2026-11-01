@@ -4,7 +4,7 @@ from urllib.parse import quote
 
 import requests
 
-from db import execute, now, row
+import store
 from translate import HEADERS
 
 BASE = "https://en.openrussian.org/ru/"
@@ -107,11 +107,10 @@ def lookup(lemma, use_cache=True):
     if not key:
         return {"lemma": "", "found": False, "error": "Empty word"}
     if use_cache:
-        cached = row("SELECT payload FROM dictionary_cache WHERE lemma = ?", (key,))
+        cached = store.dictionary_get(key)
         if cached:
-            payload = json.loads(cached["payload"])
-            payload["cached"] = True
-            return payload
+            cached["cached"] = True
+            return cached
     try:
         url, resp = search(key)
     except requests.RequestException as exc:
@@ -135,8 +134,5 @@ def lookup(lemma, use_cache=True):
     payload["url"] = url
     if info.get("redirectTo"):
         payload["redirect_to"] = info["redirectTo"]
-    execute(
-        "INSERT OR REPLACE INTO dictionary_cache (lemma, payload, created_at) VALUES (?, ?, ?)",
-        (key, json.dumps(payload, ensure_ascii=False), now()),
-    )
+    store.dictionary_put(key, payload)
     return payload
