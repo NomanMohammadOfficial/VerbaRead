@@ -212,10 +212,13 @@ def word_update(word_id, **fields):
         return
     if REMOTE:
         filtered["updated_at"] = now()
-        # Supabase integer columns reject float values like 3.0
-        for int_field in ("status", "reps", "lapses", "interval_days", "due_at", "last_reviewed_at"):
+        # Ensure integer and float fields have matching types for Supabase
+        for int_field in ("status", "reps", "lapses", "due_at", "last_reviewed_at"):
             if int_field in filtered and filtered[int_field] is not None:
                 filtered[int_field] = int(filtered[int_field])
+        for float_field in ("ease", "interval_days"):
+            if float_field in filtered and filtered[float_field] is not None:
+                filtered[float_field] = float(filtered[float_field])
         params = {"id": f"eq.{word_id}"}
         _rest("PATCH", "words", params, filtered, prefer="return=minimal")
     else:
@@ -395,11 +398,11 @@ def context_count(word_id):
 def review_add(word_id, grade, interval_before, interval_after, reviewed_at):
     if REMOTE:
         payload = {
-            "word_id": word_id,
-            "grade": grade,
-            "interval_before": interval_before,
-            "interval_after": interval_after,
-            "reviewed_at": reviewed_at
+            "word_id": int(word_id),
+            "grade": int(grade),
+            "interval_before": float(interval_before),
+            "interval_after": float(interval_after),
+            "reviewed_at": int(reviewed_at),
         }
         _rest("POST", "reviews", payload=payload, prefer="return=minimal")
     else:
