@@ -57,5 +57,6 @@ export const api = {
   stats: () => request('/stats'),
   youtube: (url) => request(`/youtube${query({ url })}`),
   translate: (text, target = 'en') => request(`/translate${query({ text, target })}`),
+  ttsUrl: (text, voice = 'ru-RU-SvetlanaNeural') => `${BASE}/tts${query({ text, voice })}`,
   ankiUrl: `${BASE}/export/anki`,
 }

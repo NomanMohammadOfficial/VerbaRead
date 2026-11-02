@@ -49,6 +49,16 @@ export default function PhrasePanel({ phrase, lessonId, onClose, onSaved }) {
       <div className="panel-head">
         <div className="panel-head-left">
           <span className="badge">Phrase</span>
+          <button
+            type="button"
+            className="btn ghost small"
+            onClick={() => {
+              const audio = new Audio(api.ttsUrl(phrase.text))
+              audio.play().catch(() => {})
+            }}
+          >
+            Play phrase
+          </button>
         </div>
         <button type="button" className="icon-btn" onClick={onClose} aria-label="Close phrase panel">
           ×

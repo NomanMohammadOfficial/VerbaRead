@@ -6,4 +6,4 @@ pymorphy3-dicts-ru>=2.4.417150.4580142
 requests>=2.32.0
 youtube-transcript-api>=0.6.0
 python-dotenv>=1.0.0
-
+edge-tts>=6.1.9

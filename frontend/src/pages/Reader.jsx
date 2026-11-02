@@ -12,11 +12,13 @@ const CPS = 14
 function pickRussianVoice() {
   if (typeof window === 'undefined' || !window.speechSynthesis) return null
   const voices = window.speechSynthesis.getVoices()
-  return (
-    voices.find((voice) => voice.lang?.toLowerCase() === 'ru-ru') ||
-    voices.find((voice) => voice.lang?.toLowerCase().startsWith('ru')) ||
-    null
+  const ruVoices = voices.filter((voice) => voice.lang?.toLowerCase().startsWith('ru'))
+  if (!ruVoices.length) return null
+  // Prioritize high-quality natural, neural, or online voices (e.g. Google русский, Microsoft Svetlana Natural)
+  const natural = ruVoices.find((v) =>
+    /natural|online|google|enhanced|premium|neural/i.test(v.name)
   )
+  return natural || ruVoices[0]
 }
 
 export default function Reader({ lessonId, onBack, onChanged, notify }) {
@@ -51,6 +53,7 @@ export default function Reader({ lessonId, onBack, onChanged, notify }) {
   const utterRef = useRef(null)
   const pausedRef = useRef(false)
   const pauseTimerRef = useRef(null)
+  const ttsAudioRef = useRef(null)
   const dragRef = useRef({ active: false, start: -1, end: -1 })
   const suppressClickRef = useRef(false)
 
@@ -129,9 +132,30 @@ export default function Reader({ lessonId, onBack, onChanged, notify }) {
 
   const stopSpeech = useCallback(() => {
     if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel()
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause()
+      ttsAudioRef.current = null
+    }
     utterRef.current = null
     pausedRef.current = false
   }, [])
+
+  const playTtsAudio = useCallback((text) => {
+    if (!text || !text.trim()) return
+    stopSpeech()
+    const audio = new Audio(api.ttsUrl(text.trim()))
+    ttsAudioRef.current = audio
+    audio.play().catch(() => {
+      if (typeof window !== 'undefined' && window.speechSynthesis) {
+        window.speechSynthesis.cancel()
+        const utterance = new SpeechSynthesisUtterance(text.trim())
+        const voice = pickRussianVoice()
+        if (voice) utterance.voice = voice
+        utterance.lang = 'ru-RU'
+        window.speechSynthesis.speak(utterance)
+      }
+    })
+  }, [stopSpeech])
 
   const speakRange = useCallback(
     (from, to) => {
@@ -405,7 +429,7 @@ export default function Reader({ lessonId, onBack, onChanged, notify }) {
     haltAudio()
     setMediaError('')
     if (mode === 'tts') {
-      speakRange(token.start, token.end)
+      playTtsAudio(token.text)
       return
     }
     const ordinal = wordIndicesRef.current.indexOf(index)

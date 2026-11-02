@@ -2,12 +2,19 @@ import json
 import os
 import time
 from typing import Literal
+from urllib.parse import quote
 
+import requests
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
 
 import srs
 import store
@@ -460,6 +467,48 @@ def stats():
 @app.get("/api/translate")
 def translate_endpoint(text: str, target: str = "en"):
     return translate(text, target=target)
+
+
+@app.get("/api/tts")
+async def text_to_speech(text: str, voice: str = "ru-RU-SvetlanaNeural"):
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Text required")
+
+    cleaned = cleaned[:500]
+
+    # 1. Try Microsoft Edge Neural TTS (Natural human voice)
+    if edge_tts is not None:
+        try:
+            communicate = edge_tts.Communicate(cleaned, voice)
+            chunks = []
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    chunks.append(chunk["data"])
+            if chunks:
+                return Response(
+                    content=b"".join(chunks),
+                    media_type="audio/mpeg",
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
+        except Exception:
+            pass
+
+    # 2. Fallback to Google Translate TTS
+    try:
+        url = f"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q={quote(cleaned)}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200 and res.content:
+            return Response(
+                content=res.content,
+                media_type="audio/mpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"TTS service unavailable: {exc}")
+
+    raise HTTPException(status_code=500, detail="Could not generate TTS audio")
 
 
 @app.get("/api/youtube")
