@@ -25,7 +25,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-store.init()
+try:
+    store.init()
+except Exception as exc:
+    print(f"Warning: store.init() failed on startup: {exc}")
+
+
+@app.exception_handler(store.StoreError)
+def store_error_handler(request, exc):
+    return Response(
+        content=json.dumps({"detail": str(exc)}),
+        status_code=500,
+        media_type="application/json",
+    )
 
 
 class LessonIn(BaseModel):
