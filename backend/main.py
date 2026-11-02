@@ -498,7 +498,9 @@ def export_anki():
     )
 
 
-DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist")
+if not os.path.isdir(DIST):
+    DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
 if os.path.isdir(DIST):
     assets = os.path.join(DIST, "assets")
     if os.path.isdir(assets):
