@@ -20,7 +20,7 @@ from translate import translate
 app = FastAPI(title="RU Reader", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

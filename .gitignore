@@ -15,5 +15,13 @@ backend/venv/
 node_modules/
 frontend/dist/
 
+# Environment & local secrets
+.env
+.env.*
+backend/.env
+
+# Vercel
+.vercel/
+
 # Logs
 *.log
