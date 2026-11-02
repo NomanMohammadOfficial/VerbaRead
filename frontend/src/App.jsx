@@ -50,12 +50,66 @@ function Icon({ name }) {
   )
 }
 
+function getRouteFromLocation() {
+  const hash = window.location.hash
+  if (hash) {
+    const matchHash = hash.match(/^#\/?(?:reader|lesson)\/(\d+)$/)
+    if (matchHash) {
+      return { page: 'reader', lessonId: parseInt(matchHash[1], 10) }
+    }
+    const cleanHash = hash.replace(/^#\/?/, '')
+    if (['words', 'practice', 'stats', 'library'].includes(cleanHash)) {
+      return { page: cleanHash, lessonId: null }
+    }
+  }
+
+  const params = new URLSearchParams(window.location.search)
+  const queryLesson = params.get('lesson') || params.get('reader')
+  if (queryLesson && /^\d+$/.test(queryLesson)) {
+    return { page: 'reader', lessonId: parseInt(queryLesson, 10) }
+  }
+
+  const path = window.location.pathname.replace(/\/+$/, '') || '/'
+  const matchReader = path.match(/^\/(?:reader|lesson)\/(\d+)$/)
+  if (matchReader) {
+    return { page: 'reader', lessonId: parseInt(matchReader[1], 10) }
+  }
+  if (path === '/words') return { page: 'words', lessonId: null }
+  if (path === '/practice') return { page: 'practice', lessonId: null }
+  if (path === '/stats') return { page: 'stats', lessonId: null }
+  return { page: 'library', lessonId: null }
+}
+
+function updateBrowserUrl(toPage, toLessonId = null) {
+  let targetUrl = '/'
+  if (toPage === 'reader' && toLessonId) {
+    targetUrl = `/reader/${toLessonId}`
+  } else if (toPage && toPage !== 'library') {
+    targetUrl = `/${toPage}`
+  }
+
+  if (window.location.pathname !== targetUrl) {
+    window.history.pushState({ page: toPage, lessonId: toLessonId }, '', targetUrl)
+  }
+}
+
 export default function App() {
-  const [page, setPage] = useState('library')
-  const [lessonId, setLessonId] = useState(null)
+  const initialRoute = getRouteFromLocation()
+  const [page, setPage] = useState(initialRoute.page)
+  const [lessonId, setLessonId] = useState(initialRoute.lessonId)
   const [stats, setStats] = useState(null)
   const [toast, setToast] = useState(null)
   const timerRef = useRef(null)
+
+  useEffect(() => {
+    const onPopState = () => {
+      const route = getRouteFromLocation()
+      setPage(route.page)
+      setLessonId(route.lessonId)
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
 
   const refreshStats = useCallback(() => {
     api.stats().then(setStats).catch(() => setStats(null))
@@ -76,11 +130,13 @@ export default function App() {
   function openLesson(id) {
     setLessonId(id)
     setPage('reader')
+    updateBrowserUrl('reader', id)
   }
 
   function go(next) {
     setPage(next)
     setLessonId(null)
+    updateBrowserUrl(next)
   }
 
   const activePage = page === 'reader' && !lessonId ? 'library' : page
