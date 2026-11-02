@@ -40,7 +40,7 @@ def _check(response):
     snippet = response.text[:300] if response.text else ""
     raise StoreError(f"Supabase request failed: {response.status_code} {snippet}")
 
-def _rest(method, table, params=None, payload=None, prefer=None, extra=None):
+def _rest(method, table, params=None, payload=None, prefer=None, extra=None, return_raw=False):
     url = f"{REST}/{table}"
     if params:
         url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
@@ -59,6 +59,8 @@ def _rest(method, table, params=None, payload=None, prefer=None, extra=None):
         else:
             raise ValueError(f"Unsupported method: {method}")
         _check(r)
+        if return_raw:
+            return r
         if r.headers.get("content-type", "").startswith("application/json") and r.text:
             return r.json()
         return None
@@ -70,11 +72,22 @@ def _fetch(table, params=None):
 
 def _count(table, params=None):
     p = dict(params or {})
-    result = _rest("GET", table, p, prefer="count=exact", extra={"Range": "0-0"})
-    content_range = result if isinstance(result, str) else ""
+    p["select"] = "id"
+    p["limit"] = "1"
+    r = _rest("GET", table, p, prefer="count=exact", return_raw=True)
+    content_range = r.headers.get("Content-Range", "")
     if "/" in content_range:
-        return int(content_range.split("/")[1])
-    return 0
+        total = content_range.split("/")[1].strip()
+        if total != "*":
+            try:
+                return int(total)
+            except ValueError:
+                pass
+    try:
+        data = r.json()
+        return len(data) if isinstance(data, list) else 0
+    except Exception:
+        return 0
 
 LESSON_COLUMNS = "id,title,text,source_type,youtube_id,audio_url,cues_json,created_at,last_opened_at,position"
 LESSON_FIELDS = ("title", "position", "last_opened_at")
@@ -478,6 +491,9 @@ def init():
                 raise StoreError(f"Supabase table '{table}' not accessible. Run supabase/schema.sql in the Supabase SQL editor, or unset SUPABASE_URL and SUPABASE_SERVICE_KEY to use the local database.")
         if lesson_total() == 0:
             for lesson in db.SEED_LESSONS:
-                lesson_create(lesson[0], lesson[1], "text")
+                title = lesson[0]
+                existing = _fetch("lessons", {"select": "id", "title": f"eq.{title}", "limit": "1"})
+                if not existing:
+                    lesson_create(lesson[0], lesson[1], "text")
     else:
         db.init_db()
